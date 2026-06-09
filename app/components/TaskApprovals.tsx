@@ -1,3 +1,4 @@
+/* eslint-disable @next/next/no-img-element */
 "use client";
 
 import { useState, useEffect } from "react";
@@ -67,8 +68,7 @@ export default function TaskApprovals() {
               {/* Task Details */}
               <div className="p-4">
                 <p className="font-semibold text-gray-900">{task.name}</p>
-                <p className="text-gray-600 text-sm mb-4">"{task.description}"</p>
-                
+                <p className="text-gray-600 text-sm mb-4">&quot;{task.description}&quot;</p>                
                 {/* Action Buttons */}
                 <div className="flex gap-2">
                   <button 

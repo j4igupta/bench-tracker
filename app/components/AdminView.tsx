@@ -45,8 +45,8 @@ export default function AdminView() {
     setIsSyncing(true);
     try {
       const querySnapshot = await getDocs(collection(db, "attendance"));
-      const summaryPayload: any[] = [];
-      const logsPayload: any[] = [];
+      const summaryPayload: Record<string, string | number>[] = [];
+      const logsPayload: Record<string, string | null>[] = [];
 
       querySnapshot.forEach((doc) => {
         const data = doc.data();
