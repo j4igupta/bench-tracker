@@ -2,90 +2,51 @@
 
 import { useState } from "react";
 import { Scanner } from "@yudiel/react-qr-scanner";
-import { doc, getDoc, setDoc, collection, addDoc, increment } from "firebase/firestore";
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { collection, addDoc } from "firebase/firestore";
+import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 import imageCompression from "browser-image-compression";
 import { db, auth, storage } from "../../lib/firebase";
+import { processScan, attributeTaskToActiveSession } from "../../lib/session";
+
+// Photos under this size aren't worth spending time compressing.
+const SKIP_COMPRESSION_UNDER_BYTES = 300 * 1024; // 300KB
+// Reject absurdly large captures before we even try to touch them.
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20MB
 
 export default function MemberView() {
   // Scanner State
   const [isScanning, setIsScanning] = useState(false);
   const [status, setStatus] = useState("Ready to scan.");
-  
+
   // Task State
   const [taskDesc, setTaskDesc] = useState("");
   const [taskFile, setTaskFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   // --- 1. QR SCANNER & ATTENDANCE LOGIC ---
   const handleScan = async (scannedText: string) => {
     setIsScanning(false);
     setStatus("Verifying QR code...");
 
+    const user = auth.currentUser;
+    if (!user) return;
+
     try {
-      const benchDoc = await getDoc(doc(db, "benches", "active"));
-      if (!benchDoc.exists()) {
-        setStatus("❌ No active Bench session right now.");
-        return;
-      }
-
-      if (scannedText === benchDoc.data().currentQrPayload) {
-        const user = auth.currentUser;
-        if (!user) return;
-
-        const attendanceRef = doc(db, "attendance", user.uid);
-        const attendanceSnap = await getDoc(attendanceRef);
-
-        // SCENARIO A: They are currently checked in, so they are trying to Check Out.
-        if (attendanceSnap.exists() && attendanceSnap.data().status === "Checked In") {
-          const checkInTime = attendanceSnap.data().checkInTime.toDate();
-          const checkOutTime = new Date();
-          const hoursSpent = (checkOutTime.getTime() - checkInTime.getTime()) / (1000 * 60 * 60);
-
-          await setDoc(attendanceRef, {
-            checkOutTime: checkOutTime,
-            status: "Checked Out",
-            totalHours: increment(hoursSpent), 
-            benchesAttended: increment(1) // <-- ADD THIS LINE to count the benches!
-          }, { merge: true });
-          
-          setStatus(`✅ Checked Out! You logged ${hoursSpent.toFixed(2)} hours.`);
-        } 
-        
-        // SCENARIO B: They exist in the system, but are checked out. Time to Check In!
-        else if (attendanceSnap.exists()) {
-          await setDoc(attendanceRef, {
-            checkInTime: new Date(),
-            status: "Checked In"
-            // We specifically DO NOT touch totalHours here so we don't overwrite it!
-          }, { merge: true });
-          
-          setStatus("✅ Successfully Checked In! Don't forget to scan out later.");
-        } 
-        
-        // SCENARIO C: First time ever checking in.
-        else {
-          await setDoc(attendanceRef, {
-            userId: user.uid,
-            name: user.displayName,
-            email: user.email,
-            checkInTime: new Date(),
-            status: "Checked In",
-            totalHours: 0 // Initialize their total hours tracker
-          });
-          
-          setStatus("✅ Successfully Checked In! Don't forget to scan out later.");
-        }
-      } else {
-        setStatus("❌ Invalid or expired QR Code.");
-      }
+      const result = await processScan(
+        scannedText,
+        user.uid,
+        user.displayName || "Unknown",
+        user.email || ""
+      );
+      setStatus(result.message);
     } catch (error) {
       console.error(error);
       setStatus("❌ Error connecting to database.");
     }
   };
 
-  // --- 2. TASK PHOTO UPLOAD LOGIC ---
+  // --- 2. TASK PHOTO UPLOAD LOGIC (optimized for speed & reliability) ---
   const handleTaskSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!taskFile || !taskDesc) return;
@@ -93,32 +54,66 @@ export default function MemberView() {
     const user = auth.currentUser;
     if (!user) return;
 
+    if (taskFile.size > MAX_UPLOAD_BYTES) {
+      setStatus("❌ That photo is too large. Please choose a smaller one.");
+      return;
+    }
+
     setIsUploading(true);
-    setStatus("Compressing photo...");
+    setUploadProgress(0);
 
     try {
-      // Compress the image before uploading to save data and speed
-      const options = {
-        maxSizeMB: 0.5, // 500KB limit
-        maxWidthOrHeight: 1024,
-        useWebWorker: true,
-      };
-      const compressedFile = await imageCompression(taskFile, options);
+      // Skip compression for files that are already small — this alone
+      // saves several seconds on a lot of phones, since the compression
+      // worker doesn't need to spin up at all.
+      let fileToUpload: File | Blob = taskFile;
+      if (taskFile.size > SKIP_COMPRESSION_UNDER_BYTES) {
+        setStatus("Compressing photo...");
+        fileToUpload = await imageCompression(taskFile, {
+          maxSizeMB: 0.3,
+          maxWidthOrHeight: 800,
+          useWebWorker: true,
+          // Skip the slow iterative high-quality passes — proof photos
+          // don't need to be pixel-perfect, just legible.
+          initialQuality: 0.7,
+        });
+      }
 
-      // Upload to Firebase Storage
       setStatus("Uploading task proof...");
       const fileRef = ref(storage, `tasks/${user.uid}_${Date.now()}`);
-      await uploadBytes(fileRef, compressedFile);
-      
-      // Get the URL and save to Firestore
-      const photoUrl = await getDownloadURL(fileRef);
+      const uploadTask = uploadBytesResumable(fileRef, fileToUpload);
+
+      // uploadBytesResumable (vs. the old uploadBytes) auto-retries on
+      // flaky connections and gives us real progress, instead of the UI
+      // just sitting frozen on "Uploading..." with no feedback.
+      await new Promise<void>((resolve, reject) => {
+        uploadTask.on(
+          "state_changed",
+          (snapshot) => {
+            const pct = Math.round(
+              (snapshot.bytesTransferred / snapshot.totalBytes) * 100
+            );
+            setUploadProgress(pct);
+          },
+          (error) => reject(error),
+          () => resolve()
+        );
+      });
+
+      const photoUrl = await getDownloadURL(uploadTask.snapshot.ref);
+
+      // Attribute this task to whatever session the member is currently
+      // checked into (if any), so it shows up in that session's log.
+      const sessionId = await attributeTaskToActiveSession(user.uid);
+
       await addDoc(collection(db, "tasks"), {
         userId: user.uid,
         name: user.displayName,
         description: taskDesc,
         photoUrl: photoUrl,
         status: "Pending Approval",
-        submittedAt: new Date()
+        submittedAt: new Date(),
+        sessionId,
       });
 
       setStatus("✅ Task submitted for approval!");
@@ -126,9 +121,10 @@ export default function MemberView() {
       setTaskFile(null);
     } catch (error) {
       console.error("Upload failed", error);
-      setStatus("❌ Failed to upload task.");
+      setStatus("❌ Failed to upload task. Check your connection and try again.");
     } finally {
       setIsUploading(false);
+      setUploadProgress(0);
     }
   };
 
@@ -187,12 +183,21 @@ export default function MemberView() {
             />
           </div>
 
+          {isUploading && (
+            <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
+              <div
+                className="bg-blue-600 h-2 rounded-full transition-all duration-150"
+                style={{ width: `${uploadProgress}%` }}
+              />
+            </div>
+          )}
+
           <button 
             type="submit" 
             disabled={isUploading || !taskFile || !taskDesc}
             className="w-full bg-gray-900 disabled:bg-gray-300 hover:bg-gray-800 text-white font-semibold py-3 px-4 rounded-lg transition-colors"
           >
-            {isUploading ? "Uploading..." : "Submit Task for Approval"}
+            {isUploading ? `Uploading... ${uploadProgress}%` : "Submit Task for Approval"}
           </button>
         </form>
       </div>

@@ -1,0 +1,94 @@
+rules_version = '2';
+
+// -----------------------------------------------------------------------
+// IMPORTANT: this file is not auto-deployed. Paste its contents into
+// Firebase Console -> Firestore Database -> Rules -> Publish.
+// (This project has no Firebase CLI project config checked in, so there's
+// no `firebase deploy` step wired up here.)
+// -----------------------------------------------------------------------
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // --- users/{uid} ---
+    // Anyone signed in can read profiles (needed to show names in logs/lists).
+    // A user may create their OWN profile, but only as "member" — this closes
+    // the hole where any signed-in user could otherwise write role: "admin"
+    // to their own doc directly from the browser console.
+    // Only an existing admin can change someone's role afterwards.
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.uid == uid
+                    && request.resource.data.role == "member";
+      allow update: if isAdmin();
+    }
+
+    // --- locks/bench --- (the "is a session active" pointer + live QR payload)
+    // Everyone signed in can read it (members need this to validate scans and
+    // see live status). Only admins can start/stop a session.
+    match /locks/{lockId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // --- sessions/{sessionId} ---
+    match /sessions/{sessionId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+
+      // --- sessions/{sessionId}/attendees/{uid} ---
+      // A member may only create/update THEIR OWN attendee doc (check-in/out
+      // via QR scan). Admins may write any attendee doc (needed to finalize
+      // a session and auto-checkout stragglers when it ends).
+      match /attendees/{uid} {
+        allow read: if isSignedIn();
+        allow write: if isAdmin() || (isSignedIn() && request.auth.uid == uid);
+      }
+    }
+
+    // --- sessionLogs/{logId} --- (finalized per-person, per-session rows)
+    // Written only by an admin (via endBenchSession). Members can read only
+    // their own rows; admins can read everything.
+    match /sessionLogs/{logId} {
+      allow read: if isAdmin() ||
+        (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    // --- memberStats/{uid} --- (lifetime totals: hours, tasks, benches attended)
+    match /memberStats/{uid} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == uid);
+      allow write: if isAdmin();
+    }
+
+    // --- tasks/{taskId} --- (photo-proof task submissions)
+    match /tasks/{taskId} {
+      allow read: if isAdmin() ||
+        (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      // Only admins can approve/reject.
+      allow update: if isAdmin();
+    }
+
+    // --- Legacy collections (no longer written by the app) ---
+    // Kept read-only in case you still want to see old data; safe to delete
+    // once you've migrated/archived anything you care about.
+    match /attendance/{docId} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == docId);
+      allow write: if false;
+    }
+    match /benches/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+  }
+}
