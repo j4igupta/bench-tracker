@@ -1,131 +1,119 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { doc, setDoc, deleteDoc, collection, getDocs } from "firebase/firestore";
-import { db } from "../../lib/firebase";
+import { auth } from "../../lib/firebase";
+import {
+  subscribeToLock,
+  startBenchSession,
+  endBenchSession,
+  rotateQrPayload,
+} from "../../lib/session";
+import type { LockData } from "../../lib/session";
 
 export default function AdminView() {
-  const [isActive, setIsActive] = useState(false);
-  const [qrPayload, setQrPayload] = useState("");
+  const [lock, setLock] = useState<LockData | null>(null);
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState("");
 
-  const startBench = async () => setIsActive(true);
+  // Keep the true state of "is there an active session" synced live from
+  // Firestore, instead of local-only state. This means a page refresh (or
+  // a second admin opening the dashboard) always shows the real status.
+  useEffect(() => {
+    const unsubscribe = subscribeToLock((lockData) => setLock(lockData));
+    return () => unsubscribe();
+  }, []);
 
-  const stopBench = async () => {
-    setIsActive(false);
-    setQrPayload("");
-    await deleteDoc(doc(db, "benches", "active"));
-  };
+  // Rotate the QR code every 60 seconds while a session is active. Any
+  // admin with this view open will keep the code fresh, so it survives
+  // the original admin closing their tab.
+  const sessionIdRef = useRef<string | null>(null);
+  sessionIdRef.current = lock?.activeSessionId ?? null;
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    const updateQRCode = async () => {
-      const newPayload = `bench_secret_${new Date().getTime()}`;
-      setQrPayload(newPayload);
-      await setDoc(doc(db, "benches", "active"), {
-        currentQrPayload: newPayload,
-        updatedAt: new Date(),
-        isActive: true
-      });
-    };
+    if (!lock?.activeSessionId) return;
 
-    if (isActive) {
-      updateQRCode();
-      interval = setInterval(updateQRCode, 60000);
-    }
+    const interval = setInterval(() => {
+      if (sessionIdRef.current) {
+        rotateQrPayload(sessionIdRef.current);
+      }
+    }, 60000);
+
     return () => clearInterval(interval);
-  }, [isActive]);
+  }, [lock?.activeSessionId]);
 
-// --- NEW: Advanced Google Sheets Sync Function ---
-  const [isSyncing, setIsSyncing] = useState(false);
-  // PASTE YOUR NEW APP SCRIPT URL HERE:
-  const GOOGLE_SHEETS_WEBHOOK = "YOUR_WEB_APP_URL_HERE";
+  const startBench = async () => {
+    const user = auth.currentUser;
+    if (!user) return;
 
-  const handleSyncToSheets = async () => {
-    setIsSyncing(true);
+    setError("");
+    setIsBusy(true);
     try {
-      const querySnapshot = await getDocs(collection(db, "attendance"));
-      const summaryPayload: Record<string, string | number>[] = [];
-      const logsPayload: Record<string, string | null>[] = [];
-
-      querySnapshot.forEach((doc) => {
-        const data = doc.data();
-
-        // 1. Build Summary Data
-        summaryPayload.push({
-          name: data.name || "Unknown",
-          email: data.email || "No Email",
-          benchesAttended: data.benchesAttended || 1,
-          totalHours: data.totalHours ? parseFloat(data.totalHours).toFixed(2) : "0.00",
-          lastUpdated: new Date().toLocaleString()
-        });
-
-        // 2. Build Detailed Logs Data
-        if (data.checkInTime) {
-          const checkInDate = data.checkInTime.toDate();
-          // If they forgot to check out, we note it. Otherwise, use their checkout time.
-          const checkOutDate = data.checkOutTime ? data.checkOutTime.toDate() : null;
-
-          logsPayload.push({
-            date: checkInDate.toLocaleDateString(),
-            name: data.name || "Unknown",
-            arrivalTime: checkInDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            departureTime: checkOutDate ? checkOutDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "Forgot to Check Out"
-          });
-        }
-      });
-
-      // Send the split payload to our Apps Script
-      await fetch(GOOGLE_SHEETS_WEBHOOK, {
-        method: "POST",
-        body: JSON.stringify({ summary: summaryPayload, logs: logsPayload }),
-        headers: {
-          "Content-Type": "text/plain;charset=utf-8",
-        }
-      });
-
-      alert("✅ Successfully synced all data and logs to Google Sheets!");
-    } catch (error) {
-      console.error("Error syncing data:", error);
-      alert("❌ Failed to sync data to Google Sheets.");
+      await startBenchSession(
+        user.uid,
+        user.displayName || "Unknown",
+        user.email || ""
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start session.");
     } finally {
-      setIsSyncing(false);
+      setIsBusy(false);
     }
   };
+
+  const stopBench = async () => {
+    if (!lock?.activeSessionId) return;
+
+    setError("");
+    setIsBusy(true);
+    try {
+      await endBenchSession(lock.activeSessionId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to end session.");
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const isActive = !!lock?.activeSessionId;
 
   return (
     <div className="bg-white p-8 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center text-center mt-6">
-      <div className="flex justify-between w-full items-center mb-6">
+      <div className="w-full mb-6">
         <h2 className="text-2xl font-bold text-gray-900">Host Dashboard</h2>
-        <button 
-          onClick={handleSyncToSheets}
-          disabled={isSyncing}
-          className="bg-blue-600/90 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl transition-all shadow-md backdrop-blur-sm border border-blue-400 disabled:opacity-50"
-        >
-          {isSyncing ? "Syncing..." : "🔄 Sync to Google Sheets"}
-        </button>
       </div>
+
+      {error && (
+        <div className="w-full mb-4 bg-red-50 border border-red-200 text-red-700 text-sm font-medium rounded-lg px-4 py-3">
+          {error}
+        </div>
+      )}
 
       {!isActive ? (
         <button
           onClick={startBench}
-          className="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-8 rounded-lg transition-colors shadow-sm"
+          disabled={isBusy}
+          className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white font-semibold py-3 px-8 rounded-lg transition-colors shadow-sm"
         >
-          Start Bench Session
+          {isBusy ? "Starting..." : "Start Bench Session"}
         </button>
       ) : (
         <div className="flex flex-col items-center w-full space-y-6">
+          <p className="text-sm text-gray-500">
+            Started by <span className="font-semibold text-gray-800">{lock?.startedByName}</span>
+          </p>
           <div className="p-4 bg-white border-4 border-gray-50 rounded-2xl shadow-sm">
-            <QRCodeSVG value={qrPayload} size={256} />
+            <QRCodeSVG value={lock?.qrPayload || ""} size={256} />
           </div>
           <p className="text-sm font-medium text-blue-600 animate-pulse bg-blue-50 px-4 py-2 rounded-full">
             QR Code updates automatically every 60 seconds
           </p>
           <button
             onClick={stopBench}
-            className="w-full bg-red-50 hover:bg-red-100 text-red-600 font-semibold py-3 px-8 rounded-lg transition-colors"
+            disabled={isBusy}
+            className="w-full bg-red-50 hover:bg-red-100 disabled:opacity-50 text-red-600 font-semibold py-3 px-8 rounded-lg transition-colors"
           >
-            End Bench Session
+            {isBusy ? "Ending..." : "End Bench Session"}
           </button>
         </div>
       )}

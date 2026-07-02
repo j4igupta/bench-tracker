@@ -10,6 +10,8 @@ import { useEffect, useState } from "react";
 import AdminView from "../components/AdminView";
 import MemberView from "../components/MemberView";
 import TaskApprovals from "../components/TaskApprovals";
+import CurrentlyPresent from "../components/CurrentlyPresent";
+import SessionLogs from "../components/SessionLogs";
 
 export default function Dashboard() {
   const [user, loading] = useAuthState(auth);
@@ -97,12 +99,16 @@ export default function Dashboard() {
         {role === "admin" ? (
           <div className="space-y-6">
             <AdminView />
+            <CurrentlyPresent />
             <MemberView />
             <TaskApprovals />
+            <SessionLogs role={role} />
           </div>
         ) : (
           <div className="space-y-6">
+            <CurrentlyPresent />
             <MemberView />
+            <SessionLogs role={role} />
           </div>
         )}
       </div>

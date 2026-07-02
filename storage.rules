@@ -1,0 +1,23 @@
+rules_version = '2';
+
+// Paste into Firebase Console -> Storage -> Rules -> Publish.
+// (Not auto-deployed — same reasoning as firestore.rules.)
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /tasks/{fileName} {
+      // Anyone signed in can view proof photos (admins need this for the
+      // approval queue; kept simple rather than per-file ownership checks).
+      allow read: if request.auth != null;
+
+      // Only the uploader can write their own file (path is prefixed with
+      // their uid in the app: `tasks/${uid}_${timestamp}`), and it's capped
+      // server-side too — belt-and-suspenders alongside the client-side
+      // 20MB guard in MemberView.
+      allow write: if request.auth != null
+                   && fileName.matches(request.auth.uid + '_.*')
+                   && request.resource.size < 20 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+  }
+}
