@@ -28,7 +28,11 @@ export default function AdminView() {
   // admin with this view open will keep the code fresh, so it survives
   // the original admin closing their tab.
   const sessionIdRef = useRef<string | null>(null);
-  sessionIdRef.current = lock?.activeSessionId ?? null;
+  
+  // FIX: Update ref inside a useEffect to keep render pure
+  useEffect(() => {
+    sessionIdRef.current = lock?.activeSessionId ?? null;
+  }, [lock?.activeSessionId]);
 
   useEffect(() => {
     if (!lock?.activeSessionId) return;

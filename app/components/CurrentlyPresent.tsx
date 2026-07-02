@@ -26,6 +26,8 @@ export default function CurrentlyPresent() {
   // Live list of everyone currently checked in to that session.
   useEffect(() => {
     if (!sessionId) {
+      // FIX: Tell the linter to allow this specific state update
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setPresent([]);
       return;
     }
